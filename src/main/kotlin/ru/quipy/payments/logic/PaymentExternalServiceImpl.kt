@@ -2,7 +2,6 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import kotlinx.coroutines.delay
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -52,41 +51,49 @@ class PaymentExternalServiceImpl(
         build()
     }
 
-    private fun getAccountProcessingInfo(paymentStartedAt: Long): AccountProcessingInfo {
-        while (true) {
-            for (accountProcessingInfo in accountProcessingInfos) {
-                if (accountProcessingInfo.queueLength.get() == 0 && accountProcessingInfo.rateLimiter.tick()) {
-                    logger.warn("[${accountProcessingInfo.accountName}] ${accountProcessingInfo.queueLength.get()}. Already passed: ${now() - paymentStartedAt} ms")
-                    accountProcessingInfo.requestCounter.putIntoWindow()
-                    return accountProcessingInfo
-                }
-                val waitStartTime = now()
-                if (
-                    Duration
-                        .ofMillis(
-                            paymentOperationTimeout.toMillis() - (waitStartTime - paymentStartedAt)
-                        ) - accountProcessingInfo.request95thPercentileProcessingTime >
-                    Duration
-                        .ofSeconds((accountProcessingInfo.speed() * accountProcessingInfo.queueLength.get()).toLong())
-                ) {
-                    val number = accountProcessingInfo.queueLength.getAndIncrement()
-                    logger.warn("[${accountProcessingInfo.accountName}] Added payment for queue. Current number $number. Already passed: ${now() - paymentStartedAt} ms")
-                } else {
-                    continue
-                }
-                do {
-                    if (accountProcessingInfo.rateLimiter.tick()) {
-                        accountProcessingInfo.queueLength.decrementAndGet()
-                        accountProcessingInfo.requestCounter.putIntoWindow()
+    private fun getAccountProcessingInfo(paymentId: UUID, paymentStartedAt: Long): AccountProcessingInfo {
+        for (accountProcessingInfo in accountProcessingInfos) {
+            if (
+                (Duration
+                    .ofMillis(
+                        paymentOperationTimeout.toMillis() - (now() - paymentStartedAt)
+                    ) - accountProcessingInfo.request95thPercentileProcessingTime).toMillis() * accountProcessingInfo.speedPerMillisecond() >
+                accountProcessingInfo.queueLength.get()
+
+            ) {
+                if (accountProcessingInfo.queueLength.get() == 0) {
+                    val windowResult = accountProcessingInfo.requestCounter.putIntoWindow()
+                    if (windowResult is NonBlockingOngoingWindow.WindowResponse.Success) {
+                        while (!accountProcessingInfo.rateLimiter.tick()) {
+                            logger.warn("[${accountProcessingInfo.accountName}] Payment $paymentId waiting for tick. Already passed: ${now() - paymentStartedAt} ms")
+                            continue
+                        }
                         return accountProcessingInfo
                     }
-                } while (true)
+                }
+                val number = accountProcessingInfo.queueLength.getAndIncrement()
+                logger.warn("[${accountProcessingInfo.accountName}] Added payment $paymentId in queue. Current number $number. Already passed: ${now() - paymentStartedAt} ms")
+            } else {
+                continue
             }
+            do {
+                val windowResult = accountProcessingInfo.requestCounter.putIntoWindow()
+                if (windowResult is NonBlockingOngoingWindow.WindowResponse.Success) {
+                    accountProcessingInfo.queueLength.decrementAndGet()
+                    while (!accountProcessingInfo.rateLimiter.tick()) {
+                        logger.warn("[${accountProcessingInfo.accountName}] Payment $paymentId waiting for tick. Already passed: ${now() - paymentStartedAt} ms")
+                        continue
+                    }
+                    return accountProcessingInfo
+                }
+            } while (true)
         }
+        return accountProcessingInfos.last()
     }
 
     override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
-        val accountProcessingInfo = getAccountProcessingInfo(paymentStartedAt)
+        logger.warn("Payment $paymentId started choosing account. Already passed: ${now() - paymentStartedAt} ms")
+        val accountProcessingInfo = getAccountProcessingInfo(paymentId, paymentStartedAt)
         logger.warn("[${accountProcessingInfo.accountName}] Submitting payment request for payment $paymentId. Already passed: ${now() - paymentStartedAt} ms")
 
         val transactionId = UUID.randomUUID()
@@ -155,8 +162,8 @@ class PaymentExternalServiceImpl(
 
 fun ExternalServiceProperties.toAccountProcessingInfo(): AccountProcessingInfo = AccountProcessingInfo(this)
 
-data class AccountProcessingInfo(
-    private val properties: ExternalServiceProperties
+class AccountProcessingInfo(
+    properties: ExternalServiceProperties
 ) {
     val serviceName = properties.serviceName
     val accountName = properties.accountName
@@ -166,13 +173,12 @@ data class AccountProcessingInfo(
     val requestCounter = NonBlockingOngoingWindow(maxParallelRequests)
     val rateLimiter = RateLimiter(rateLimitPerSec)
     val queueLength = AtomicInteger(0)
-}
 
-fun AccountProcessingInfo.speed(): Double {
-    return min(
-        maxParallelRequests.toDouble() / (request95thPercentileProcessingTime.toMillis().toDouble() / 1000),
-        rateLimitPerSec.toDouble()
-    )
+    fun speedPerMillisecond(): Double =
+        min(
+            maxParallelRequests.toDouble() / (request95thPercentileProcessingTime.toMillis()),
+            rateLimitPerSec.toDouble() / 1000
+        )
 }
 
 public fun now() = System.currentTimeMillis()
