@@ -56,6 +56,8 @@ class ExternalServicesConfig {
     fun fastExternalService() =
         PaymentExternalServiceImpl(
             listOf(
+                accountProps_4,
+                accountProps_3,
                 accountProps_2,
                 accountProps_1
             )

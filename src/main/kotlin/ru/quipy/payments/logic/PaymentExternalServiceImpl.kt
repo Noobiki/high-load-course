@@ -9,6 +9,8 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import ru.quipy.common.utils.NonBlockingOngoingWindow
+import ru.quipy.common.utils.RateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
@@ -16,6 +18,7 @@ import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.min
 
 
 // Advice: always treat time as a Duration
@@ -52,17 +55,32 @@ class PaymentExternalServiceImpl(
     private fun getAccountProcessingInfo(paymentStartedAt: Long): AccountProcessingInfo {
         while (true) {
             for (accountProcessingInfo in accountProcessingInfos) {
-                val waitStartTime = now()
-                while (Duration.ofMillis(now() - waitStartTime) <= waitDuration) {
-                    val curRequestCount = accountProcessingInfo.requestCounter.get()
-                    if (curRequestCount < accountProcessingInfo.parallelRequests &&
-                        Duration.ofMillis(now() - paymentStartedAt) <=
-                        Duration.ofMillis(paymentOperationTimeout.toMillis() - accountProcessingInfo.request95thPercentileProcessingTime.toMillis() * 2)) {
-                        if (accountProcessingInfo.requestCounter.compareAndSet(curRequestCount, curRequestCount + 1)) {
-                            return accountProcessingInfo
-                        }
-                    }
+                if (accountProcessingInfo.queueLength.get() == 0 && accountProcessingInfo.rateLimiter.tick()) {
+                    logger.warn("[${accountProcessingInfo.accountName}] ${accountProcessingInfo.queueLength.get()}. Already passed: ${now() - paymentStartedAt} ms")
+                    accountProcessingInfo.requestCounter.putIntoWindow()
+                    return accountProcessingInfo
                 }
+                val waitStartTime = now()
+                if (
+                    Duration
+                        .ofMillis(
+                            paymentOperationTimeout.toMillis() - (waitStartTime - paymentStartedAt)
+                        ) - accountProcessingInfo.request95thPercentileProcessingTime >
+                    Duration
+                        .ofSeconds((accountProcessingInfo.speed() * accountProcessingInfo.queueLength.get()).toLong())
+                ) {
+                    val number = accountProcessingInfo.queueLength.getAndIncrement()
+                    logger.warn("[${accountProcessingInfo.accountName}] Added payment for queue. Current number $number. Already passed: ${now() - paymentStartedAt} ms")
+                } else {
+                    continue
+                }
+                do {
+                    if (accountProcessingInfo.rateLimiter.tick()) {
+                        accountProcessingInfo.queueLength.decrementAndGet()
+                        accountProcessingInfo.requestCounter.putIntoWindow()
+                        return accountProcessingInfo
+                    }
+                } while (true)
             }
         }
     }
@@ -80,9 +98,8 @@ class PaymentExternalServiceImpl(
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
-        if (Duration.ofMillis(now() - paymentStartedAt) > paymentOperationTimeout
-            || accountProcessingInfo.requestCounter.get() > accountProcessingInfo.parallelRequests) {
-            accountProcessingInfo.requestCounter.decrementAndGet()
+        if (Duration.ofMillis(now() - paymentStartedAt) > paymentOperationTimeout) {
+            accountProcessingInfo.requestCounter.releaseWindow()
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
             }
@@ -131,7 +148,7 @@ class PaymentExternalServiceImpl(
                 }
             }
         } finally {
-            accountProcessingInfo.requestCounter.decrementAndGet()
+            accountProcessingInfo.requestCounter.releaseWindow()
         }
     }
 }
@@ -143,10 +160,19 @@ data class AccountProcessingInfo(
 ) {
     val serviceName = properties.serviceName
     val accountName = properties.accountName
-    val parallelRequests = properties.parallelRequests
+    val maxParallelRequests = properties.parallelRequests
     val rateLimitPerSec = properties.rateLimitPerSec
     val request95thPercentileProcessingTime = properties.request95thPercentileProcessingTime
-    val requestCounter = AtomicInteger(0)
+    val requestCounter = NonBlockingOngoingWindow(maxParallelRequests)
+    val rateLimiter = RateLimiter(rateLimitPerSec)
+    val queueLength = AtomicInteger(0)
+}
+
+fun AccountProcessingInfo.speed(): Double {
+    return min(
+        maxParallelRequests.toDouble() / (request95thPercentileProcessingTime.toMillis().toDouble() / 1000),
+        rateLimitPerSec.toDouble()
+    )
 }
 
 public fun now() = System.currentTimeMillis()
