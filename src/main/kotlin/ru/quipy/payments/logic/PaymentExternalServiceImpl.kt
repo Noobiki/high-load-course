@@ -2,10 +2,7 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -22,7 +19,10 @@ import ru.quipy.payments.logic.tools.Queue
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.UUID
+import java.util.concurrent.BlockingQueue
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadFactory
 import kotlin.math.min
 
 
@@ -48,11 +48,20 @@ class PaymentExternalServiceImpl(
         it.toAccountProcessingWorker()
     }
 
+    private val clientThreadFactory = object : ThreadFactory {
+        private var counter = 0
+        override fun newThread(r: Runnable): Thread {
+            return Thread(r, "client-dispatcher-thread-${counter++}")
+        }
+    }
 
-    private val httpClientExecutor = Executors.newFixedThreadPool(1000)
+    private val clientDispatcher = Executors.newFixedThreadPool(1000, clientThreadFactory)
 
     private val client = OkHttpClient.Builder().run {
-        dispatcher(Dispatcher(httpClientExecutor))
+        dispatcher(Dispatcher(clientDispatcher).apply {
+            maxRequests = 10000
+            maxRequestsPerHost = 10000
+        })
         build()
     }
 
@@ -71,6 +80,7 @@ class PaymentExternalServiceImpl(
                     it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
                 }
             }
+
             for (accountProcessingWorker in accountProcessingWorkers) {
                 if ((Duration
                         .ofMillis(paymentOperationTimeout.toMillis() - (now() - paymentStartedAt))
@@ -109,13 +119,16 @@ class PaymentExternalServiceImpl(
         val info: AccountProcessingInfo
     ) {
         @OptIn(ExperimentalCoroutinesApi::class)
-        private val requestScope = CoroutineScope(Dispatchers.IO.limitedParallelism(100))
+        private val requestScope = CoroutineScope(Dispatchers.IO.limitedParallelism(100)
+                + CoroutineName("CoroutineScope: payment request scope"))
 
         @OptIn(ExperimentalCoroutinesApi::class)
-        private val queueProcessingScope = CoroutineScope(Dispatchers.IO.limitedParallelism(100))
+        private val queueProcessingScope = CoroutineScope(Dispatchers.IO.limitedParallelism(100)
+                + CoroutineName("CoroutineScope: queue processing scope"))
 
         private val requestCounter = NonBlockingOngoingWindow(info.maxParallelRequests)
         private val rateLimiter = RateLimiter(info.rateLimitPerSec)
+
         val paymentQueue: Queue<PaymentInfo> = FAAQueue()
 
         private fun sendRequest(
