@@ -2,6 +2,9 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry
 import kotlinx.coroutines.*
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
@@ -46,15 +49,6 @@ class PaymentExternalServiceImpl(
 
     private val accountProcessingWorkers = properties.map {
         it.toAccountProcessingWorker()
-    }
-
-    private val clientThreadFactory = NamedThreadFactory("client-dispatcher-thread")
-
-    private val clientDispatcher = Executors.newFixedThreadPool(1000, clientThreadFactory)
-
-    private val client = OkHttpClient.Builder().run {
-        dispatcher(Dispatcher(clientDispatcher))
-        build()
     }
 
     private fun pickAccountProcessingWorker(
@@ -140,6 +134,26 @@ class PaymentExternalServiceImpl(
         private val requestCounter = NonBlockingOngoingWindow(info.maxParallelRequests)
         private val rateLimiter = RateLimiter(info.rateLimitPerSec)
 
+        private val clientThreadFactory = NamedThreadFactory("client-dispatcher-thread")
+
+        private val clientDispatcher = Executors.newFixedThreadPool(1000, clientThreadFactory)
+
+        private val client = OkHttpClient.Builder().run {
+            dispatcher(Dispatcher(clientDispatcher))
+            build()
+        }
+
+        private val circuitBreakerConfig = CircuitBreakerConfig.custom()
+            .failureRateThreshold(50f)
+            .waitDurationInOpenState(Duration.ofMillis(1000))
+            .permittedNumberOfCallsInHalfOpenState(5)
+            .slidingWindowSize(100)
+            .build()
+
+        private val circuitBreakerRegistry = CircuitBreakerRegistry.of(circuitBreakerConfig)
+
+        private val circuitBreaker = circuitBreakerRegistry.circuitBreaker("abobus")
+
         private fun sendRequest(
             transactionId: UUID, paymentId: UUID, amount: Int, paymentStartedAt: Long
         ) {
@@ -201,24 +215,28 @@ class PaymentExternalServiceImpl(
             paymentId: UUID, amount: Int, paymentStartedAt: Long
         ) {
             val transactionId = UUID.randomUUID()
-            paymentExecutor.submit(
-                Runnable {
-                    while(true) {
-                        val windowResult = requestCounter.putIntoWindow()
-                        if (windowResult is NonBlockingOngoingWindow.WindowResponse.Success) {
-                            while (!rateLimiter.tick()) {
+            val supplier = CircuitBreaker.decorateSupplier(circuitBreaker) {
+                paymentExecutor.submit(
+                    Runnable {
+                        while(true) {
+                            val windowResult = requestCounter.putIntoWindow()
+                            if (windowResult is NonBlockingOngoingWindow.WindowResponse.Success) {
+                                while (!rateLimiter.tick()) {
+                                    continue
+                                }
+
+                                break
+                            } else {
                                 continue
                             }
-
-                            break
-                        } else {
-                            continue
                         }
-                    }
 
-                    sendRequest(transactionId, paymentId, amount, paymentStartedAt)
-                }
-            )
+                        sendRequest(transactionId, paymentId, amount, paymentStartedAt)
+                    }
+                )
+            }
+
+            circuitBreaker.executeSupplier(supplier)
             logger.warn("[${info.accountName}] Added payment $paymentId in queue. Current number ${blockingQueue.size}. Already passed: ${now() - paymentStartedAt} ms")
         }
 
